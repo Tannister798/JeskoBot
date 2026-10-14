@@ -1,6 +1,9 @@
 # Compiler files
 cache/
 out/
+__pycache__/
+*.py[cod]
+.venv/
 
 # Commonly ignored directories
 .logs/

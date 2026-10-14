@@ -10,6 +10,7 @@ import "../src/PriceFeed.sol";
 
 contract DeployScript is Script {
     function run() external {
+        require(block.chainid == 421614, "Arbitrum Sepolia only");
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(deployerPrivateKey);
 
@@ -22,7 +23,7 @@ contract DeployScript is Script {
         console.log("MockPriceFeed deployed at:", address(priceFeed));
 
         // 3. Deploy PrivateAMM
-        address WETH = 0x980B62Da83eFf3D4576C647993b0c1D7faf17c73; // replace later with real WETH
+        address WETH = vm.envAddress("WETH");
         PrivateAMM amm = new PrivateAMM(address(cz), WETH);
         console.log("PrivateAMM deployed at:", address(amm));
 
@@ -30,14 +31,18 @@ contract DeployScript is Script {
         SkewKeeper keeper = new SkewKeeper(address(amm), address(priceFeed));
         console.log("SkewKeeper deployed at:", address(keeper));
 
-        // 5. Deploy HouseBorrower (4 arguments)
-        address AAVE_POOL = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
+        // 5. Deploy HouseBorrower with the configured Uniswap V3 buyback route
+        address AAVE_POOL = vm.envAddress("AAVE_POOL");
+        address SWAP_ROUTER = vm.envAddress("UNISWAP_V3_ROUTER");
+        uint24 SWAP_FEE = uint24(vm.envUint("UNISWAP_V3_FEE"));
 
         HouseBorrower borrower = new HouseBorrower(
             address(cz),
             address(amm),
             WETH,
-            AAVE_POOL
+            AAVE_POOL,
+            SWAP_ROUTER,
+            SWAP_FEE
         );
         console.log("HouseBorrower deployed at:", address(borrower));
 

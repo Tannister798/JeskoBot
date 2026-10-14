@@ -20,13 +20,42 @@ interface IPool {
     ) external;
 }
 
+interface IUniswapV3SwapRouter {
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactOutputSingle(ExactOutputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountIn);
+}
+
 contract HouseBorrower is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     using SafeERC20 for IERC20;
+
+    struct CycleData {
+        uint256 mintAmount;
+        uint256 aaveAmount;
+        uint256 aavePremium;
+        uint256 deadline;
+        uint256 startingWethBalance;
+        uint256 maxWethIn;
+    }
 
     CZToken public immutable cz;
     PrivateAMM public immutable amm;
     IERC20 public immutable weth;
     IPool public immutable aavePool;
+    IUniswapV3SwapRouter public immutable swapRouter;
+    uint24 public immutable swapFee;
 
     uint256 public minProfit;
     uint256 public maxTradeSize;
@@ -48,12 +77,28 @@ contract HouseBorrower is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
         address _cz,
         address _amm,
         address _weth,
-        address _aavePool
+        address _aavePool,
+        address _swapRouter,
+        uint24 _swapFee
     ) Ownable(msg.sender) {
+        require(_cz.code.length > 0, "Invalid CZ token");
+        require(_amm.code.length > 0, "Invalid AMM");
+        require(_weth.code.length > 0, "Invalid WETH");
+        require(_aavePool.code.length > 0, "Invalid Aave pool");
+        require(_swapRouter.code.length > 0, "Invalid swap router");
+        require(_swapFee < 1_000_000, "Invalid swap fee");
+        require(
+            address(PrivateAMM(_amm).token0()) == _cz
+                && address(PrivateAMM(_amm).token1()) == _weth,
+            "Invalid AMM pair"
+        );
+
         cz = CZToken(_cz);
         amm = PrivateAMM(_amm);
         weth = IERC20(_weth);
         aavePool = IPool(_aavePool);
+        swapRouter = IUniswapV3SwapRouter(_swapRouter);
+        swapFee = _swapFee;
 
         minProfit = 0.01 ether;
         maxTradeSize = 100_000 ether;
@@ -75,21 +120,31 @@ contract HouseBorrower is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     function executeCycle(
         uint256 mintAmount,
         uint256 loanAmount,
-        uint256 deadline
+        uint256 deadline,
+        uint256 maxWethIn
     ) external onlyOwner nonReentrant whenNotPaused {
         require(block.timestamp <= deadline, "Deadline passed");
         require(mintAmount > 0 && mintAmount <= maxTradeSize, "Invalid mint size");
         require(loanAmount > 0, "Invalid loan size");
+        require(maxWethIn > 0, "Invalid swap limit");
 
         emit CycleStarted(mintAmount, loanAmount);
 
-        bytes memory params = abi.encode(mintAmount, deadline);
+        uint256 startingWethBalance = weth.balanceOf(address(this));
+        CycleData memory cycle = CycleData(
+            mintAmount,
+            0,
+            0,
+            deadline,
+            startingWethBalance,
+            maxWethIn
+        );
 
         aavePool.flashLoanSimple(
             address(this),
             address(weth),
             loanAmount,
-            params,
+            abi.encode(cycle),
             0
         );
     }
@@ -105,12 +160,12 @@ contract HouseBorrower is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
         require(initiator == address(this), "Invalid initiator");
         require(asset == address(weth), "Wrong asset");
 
-        (uint256 mintAmount, uint256 deadline) = abi.decode(params, (uint256, uint256));
-        require(block.timestamp <= deadline, "Deadline");
+        CycleData memory cycle = abi.decode(params, (CycleData));
+        require(block.timestamp <= cycle.deadline, "Deadline");
+        cycle.aaveAmount = amount;
+        cycle.aavePremium = premium;
 
-        bytes memory czData = abi.encode(amount, premium, deadline);
-
-        cz.flashLoan(this, address(cz), mintAmount, czData);
+        cz.flashLoan(this, address(cz), cycle.mintAmount, abi.encode(cycle));
 
         return true;
     }
@@ -126,41 +181,66 @@ contract HouseBorrower is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
         require(initiator == address(this), "Invalid initiator");
         require(token == address(cz), "Wrong token");
 
-        (uint256 aaveAmount, uint256 aavePremium, uint256 deadline) =
-            abi.decode(data, (uint256, uint256, uint256));
-        require(block.timestamp <= deadline, "Deadline expired");
-
-        uint256 totalAaveDebt = aaveAmount + aavePremium;
+        CycleData memory cycle = abi.decode(data, (CycleData));
+        require(block.timestamp <= cycle.deadline, "Deadline expired");
         uint256 totalCzDebt = amount + fee;
 
+        uint256 profit = _executeArbitrage(cycle, totalCzDebt);
+        emit CycleSuccess(amount, profit);
+
+        return CALLBACK_SUCCESS;
+    }
+
+    function _executeArbitrage(CycleData memory cycle, uint256 totalCzDebt)
+        private
+        returns (uint256 profit)
+    {
+        uint256 totalAaveDebt = cycle.aaveAmount + cycle.aavePremium;
+
         // 1. Add temporary liquidity
-        weth.approve(address(amm), aaveAmount);
-        amm.addLiquidity(0, aaveAmount);
+        weth.forceApprove(address(amm), cycle.aaveAmount);
+        amm.addLiquidity(0, cycle.aaveAmount);
 
         // 2. Swap CZ → WETH on skewed AMM
-        cz.approve(address(amm), amount);
-        (, uint256 wethBought) = amm.swap(amount, 0);
+        IERC20(address(cz)).forceApprove(address(amm), cycle.mintAmount);
+        (, uint256 wethBought) = amm.swap(cycle.mintAmount, 0);
         require(wethBought > 0, "Swap failed");
 
         // 3. Remove temporary liquidity
         amm.removeMyTemporaryLiquidity();
 
-        // 4. Repay CZ
-        cz.approve(address(cz), totalCzDebt);
+        // 4. Buy back the flash-minted CZ before its lender pulls repayment.
+        uint256 availableWeth = weth.balanceOf(address(this)) - cycle.startingWethBalance;
+        require(cycle.maxWethIn <= availableWeth, "Swap limit exceeds proceeds");
+        weth.forceApprove(address(swapRouter), cycle.maxWethIn);
+        uint256 wethSpent = swapRouter.exactOutputSingle(
+            IUniswapV3SwapRouter.ExactOutputSingleParams({
+                tokenIn: address(weth),
+                tokenOut: address(cz),
+                fee: swapFee,
+                recipient: address(this),
+                deadline: cycle.deadline,
+                amountOut: totalCzDebt,
+                amountInMaximum: cycle.maxWethIn,
+                sqrtPriceLimitX96: 0
+            })
+        );
+        weth.forceApprove(address(swapRouter), 0);
+        require(wethSpent <= cycle.maxWethIn, "Swap limit exceeded");
 
-        // 5. Repay Aave
-        weth.approve(address(aavePool), totalAaveDebt);
+        // 5. Approve flash-loan repayments.
+        IERC20(address(cz)).forceApprove(address(cz), totalCzDebt);
 
-        // 6. Profit check
+        weth.forceApprove(address(aavePool), totalAaveDebt);
+
         uint256 remainingWeth = weth.balanceOf(address(this));
-        require(remainingWeth >= totalAaveDebt + minProfit, "Not enough profit");
+        require(remainingWeth >= cycle.startingWethBalance, "Initial balance spent");
+        uint256 cycleWeth = remainingWeth - cycle.startingWethBalance;
+        require(cycleWeth >= totalAaveDebt + minProfit, "Not enough profit");
 
-        uint256 profit = remainingWeth - totalAaveDebt;
+        profit = cycleWeth - totalAaveDebt;
         weth.safeTransfer(owner(), profit);
 
-        emit CycleSuccess(amount, profit);
-
-        return CALLBACK_SUCCESS;
     }
 
     function emergencyWithdraw(address token) external onlyOwner {

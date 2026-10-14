@@ -6,6 +6,7 @@ import "../src/HouseBorrowerPure.sol";
 
 contract DeployPure is Script {
     function run() external {
+        require(block.chainid == 421614, "Arbitrum Sepolia only");
         uint256 pk = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(pk);
 
