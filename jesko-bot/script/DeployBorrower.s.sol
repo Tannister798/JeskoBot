@@ -6,7 +6,7 @@ import "../src/HouseBorrower.sol";
 
 contract DeployBorrower is Script {
     function run() external {
-        require(block.chainid == 42161, "Arbitrum One only");
+        require(block.chainid == 421614, "Legacy borrower is Sepolia-only");
         uint256 pk = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(pk);
 
