@@ -43,14 +43,13 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
     IBalancerVault public constant BALANCER_VAULT =
         IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
 
-    // Arbitrum One Uniswap V3 router
     IUniswapV3Router public constant UNI_ROUTER =
         IUniswapV3Router(0xE592427A0AEce92De3Edee1F18E0157C05861564);
 
     CZToken public immutable cz;
     PrivateAMM public immutable amm;
     IERC20 public immutable weth;
-    IERC20 public immutable usdc; // native USDC on Arbitrum: 0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+    IERC20 public immutable usdc;
 
     uint256 public minProfit;
     uint256 public maxTradeSize;
@@ -69,6 +68,8 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
     }
 
     constructor(address _cz, address _amm, address _weth, address _usdc) Ownable(msg.sender) {
+        require(_cz != address(0) && _amm != address(0), "Zero");
+        require(_weth != address(0) && _usdc != address(0), "Zero");
         cz = CZToken(_cz);
         amm = PrivateAMM(_amm);
         weth = IERC20(_weth);
@@ -128,7 +129,6 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
         bytes memory czData = abi.encode(loanAmount, feeAmount, minUsdcOut, deadline);
         cz.flashLoan(this, address(cz), mintAmount, czData);
 
-        // Balancer requires tokens returned to the Vault
         uint256 totalDebt = loanAmount + feeAmount;
         weth.safeTransfer(address(BALANCER_VAULT), totalDebt);
     }
@@ -154,22 +154,20 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
 
         uint256 totalBalancerDebt = loanAmount + balancerFee;
         uint256 totalCzDebt = amount + fee;
-        uint256 startWeth = weth.balanceOf(address(this));
 
-        // 1) Temporary liquidity: CZ + WETH
-        // Use a slice of minted CZ + full loan as temp depth
-        uint256 tempCz = amount / 10; // small CZ side for pool balance; tune later
+        uint256 tempCz = amount / 10;
+        if (tempCz == 0) tempCz = amount;
+
         cz.approve(address(amm), amount);
         weth.forceApprove(address(amm), loanAmount);
         amm.addLiquidity(tempCz, loanAmount, true);
 
-        // 2) Buy WETH cheap on skewed AMM with remaining CZ
         uint256 czForSwap = amount - tempCz;
+        if (czForSwap == 0) czForSwap = amount;
+
         (, uint256 wethBought) = amm.swap(czForSwap, 0);
         require(wethBought > 0, "AMM swap failed");
 
-        // 3) External leg: sell some WETH → USDC on Uniswap (realizes edge vs market)
-        // Sell half of bought WETH as example; bot can pass better params later
         uint256 wethToSell = wethBought / 2;
         if (wethToSell > 0) {
             weth.forceApprove(address(UNI_ROUTER), wethToSell);
@@ -186,23 +184,15 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
                 })
             );
             weth.forceApprove(address(UNI_ROUTER), 0);
-
-            // Optional: sell USDC back to WETH on another fee tier if that is the arb
-            // For v1 we keep USDC as profit buffer and prioritize WETH accounting
         }
 
-        // 4) Remove temporary liquidity
         amm.removeMyTemporaryLiquidity();
-
-        // 5) Repay CZ flash mint
         cz.approve(address(cz), totalCzDebt);
 
-        // 6) Profit check in WETH terms (must still repay Balancer after this returns)
         uint256 bal = weth.balanceOf(address(this));
         require(bal >= totalBalancerDebt + minProfit, "Not profitable");
 
         uint256 profit = bal - totalBalancerDebt;
-        // Leave totalBalancerDebt in contract for receiveFlashLoan to transfer to Vault
         if (profit > 0) {
             weth.safeTransfer(owner(), profit);
         }
