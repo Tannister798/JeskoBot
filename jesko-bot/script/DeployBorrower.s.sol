@@ -2,24 +2,44 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Script.sol";
+import "../src/CZToken.sol";
+import "../src/PrivateAMM.sol";
+import "../src/PriceFeed.sol";
+import "../src/SkewKeeper.sol";
 import "../src/HouseBorrower.sol";
 
-contract DeployBorrower is Script {
+contract DeployHouseBorrower is Script {
+    // Arbitrum One
+    address constant WETH = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
+    address constant USDC = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
+    address constant AAVE_POOL = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
+    address constant UNI_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    uint24 constant SWAP_FEE = 500; // 0.05%
+
     function run() external {
-        require(block.chainid == 421614, "Legacy borrower is Sepolia-only");
         uint256 pk = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(pk);
 
+        CZToken cz = new CZToken();
+        MockPriceFeed feed = new MockPriceFeed();
+        PrivateAMM amm = new PrivateAMM(address(cz), WETH);
+        SkewKeeper keeper = new SkewKeeper(address(amm), address(feed));
+
         HouseBorrower borrower = new HouseBorrower(
-            vm.envAddress("CZ_TOKEN"),
-            vm.envAddress("PRIVATE_AMM"),
-            vm.envAddress("WETH"),
-            vm.envAddress("AAVE_POOL"),
-            vm.envAddress("UNISWAP_V3_ROUTER"),
-            uint24(vm.envUint("UNISWAP_V3_FEE"))
+            address(cz),
+            address(amm),
+            WETH,
+            USDC,
+            AAVE_POOL,
+            UNI_ROUTER,
+            SWAP_FEE
         );
 
-        console.log("New HouseBorrower deployed at:", address(borrower));
+        console.log("CZ_TOKEN", address(cz));
+        console.log("PRICE_FEED", address(feed));
+        console.log("PRIVATE_AMM", address(amm));
+        console.log("SKEW_KEEPER", address(keeper));
+        console.log("HOUSE_BORROWER", address(borrower));
 
         vm.stopBroadcast();
     }
