@@ -19,24 +19,38 @@ interface IBalancerVault {
     ) external;
 }
 
-interface IFlashLoanRecipient {
-    function receiveFlashLoan(
-        address[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external;
+interface IUniswapV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountOut);
 }
 
-contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrower, IFlashLoanRecipient {
+contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     using SafeERC20 for IERC20;
 
     IBalancerVault public constant BALANCER_VAULT =
         IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
 
+    // Arbitrum One Uniswap V3 router
+    IUniswapV3Router public constant UNI_ROUTER =
+        IUniswapV3Router(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+
     CZToken public immutable cz;
     PrivateAMM public immutable amm;
     IERC20 public immutable weth;
+    IERC20 public immutable usdc; // native USDC on Arbitrum: 0xaf88d065e77c8cC2239327C5EDb3A432268e5831
 
     uint256 public minProfit;
     uint256 public maxTradeSize;
@@ -46,7 +60,7 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
         keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     event CycleStarted(uint256 mintAmount, uint256 loanAmount);
-    event CycleSuccess(uint256 mintAmount, uint256 profit);
+    event CycleSuccess(uint256 mintAmount, uint256 profitWeth);
     event Paused(bool isPaused);
 
     modifier whenNotPaused() {
@@ -54,12 +68,13 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
         _;
     }
 
-    constructor(address _cz, address _amm, address _weth) Ownable(msg.sender) {
+    constructor(address _cz, address _amm, address _weth, address _usdc) Ownable(msg.sender) {
         cz = CZToken(_cz);
         amm = PrivateAMM(_amm);
         weth = IERC20(_weth);
-        minProfit = 0.01 ether;
-        maxTradeSize = 250_000 ether;
+        usdc = IERC20(_usdc);
+        minProfit = 0.0001 ether;
+        maxTradeSize = 100_000 ether;
     }
 
     function setMinProfit(uint256 _min) external onlyOwner {
@@ -78,22 +93,21 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
     function executeCycle(
         uint256 mintAmount,
         uint256 loanAmount,
+        uint256 minUsdcOut,
         uint256 deadline
     ) external onlyOwner nonReentrant whenNotPaused {
-        require(block.timestamp <= deadline, "Deadline passed");
-        require(mintAmount > 0 && mintAmount <= maxTradeSize, "Invalid mint size");
-        require(loanAmount > 0, "Invalid loan size");
+        require(block.timestamp < deadline, "Deadline passed");
+        require(mintAmount > 0 && mintAmount <= maxTradeSize, "Invalid mint");
+        require(loanAmount > 0, "Invalid loan");
 
         emit CycleStarted(mintAmount, loanAmount);
 
         address[] memory tokens = new address[](1);
         tokens[0] = address(weth);
-
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = loanAmount;
 
-        bytes memory userData = abi.encode(mintAmount, deadline);
-
+        bytes memory userData = abi.encode(mintAmount, minUsdcOut, deadline);
         BALANCER_VAULT.flashLoan(address(this), tokens, amounts, userData);
     }
 
@@ -102,19 +116,19 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
         uint256[] memory amounts,
         uint256[] memory feeAmounts,
         bytes memory userData
-    ) external override {
+    ) external {
         require(msg.sender == address(BALANCER_VAULT), "Only Balancer");
         require(tokens.length == 1 && tokens[0] == address(weth), "Wrong token");
 
         uint256 loanAmount = amounts[0];
         uint256 feeAmount = feeAmounts[0];
+        (uint256 mintAmount, uint256 minUsdcOut, uint256 deadline) =
+            abi.decode(userData, (uint256, uint256, uint256));
 
-        (uint256 mintAmount, uint256 deadline) = abi.decode(userData, (uint256, uint256));
-        require(block.timestamp <= deadline, "Deadline");
-
-        bytes memory czData = abi.encode(loanAmount, feeAmount, deadline);
+        bytes memory czData = abi.encode(loanAmount, feeAmount, minUsdcOut, deadline);
         cz.flashLoan(this, address(cz), mintAmount, czData);
 
+        // Balancer requires tokens returned to the Vault
         uint256 totalDebt = loanAmount + feeAmount;
         weth.safeTransfer(address(BALANCER_VAULT), totalDebt);
     }
@@ -126,36 +140,74 @@ contract HouseBorrowerBalancer is Ownable, ReentrancyGuard, IERC3156FlashBorrowe
         uint256 fee,
         bytes calldata data
     ) external override returns (bytes32) {
-        require(msg.sender == address(cz), "Only CZToken");
-        require(initiator == address(this), "Invalid initiator");
+        require(msg.sender == address(cz), "Only CZ");
+        require(initiator == address(this), "Bad initiator");
         require(token == address(cz), "Wrong token");
 
-        (uint256 loanAmount, uint256 balancerFee, uint256 deadline) =
-            abi.decode(data, (uint256, uint256, uint256));
-        require(block.timestamp <= deadline, "Deadline expired");
+        (
+            uint256 loanAmount,
+            uint256 balancerFee,
+            uint256 minUsdcOut,
+            uint256 deadline
+        ) = abi.decode(data, (uint256, uint256, uint256, uint256));
+        require(block.timestamp <= deadline, "Deadline");
 
         uint256 totalBalancerDebt = loanAmount + balancerFee;
         uint256 totalCzDebt = amount + fee;
+        uint256 startWeth = weth.balanceOf(address(this));
 
-        weth.approve(address(amm), loanAmount);
-        amm.addLiquidity(0, loanAmount);
-
+        // 1) Temporary liquidity: CZ + WETH
+        // Use a slice of minted CZ + full loan as temp depth
+        uint256 tempCz = amount / 10; // small CZ side for pool balance; tune later
         cz.approve(address(amm), amount);
-        (, uint256 wethBought) = amm.swap(amount, 0);
-        require(wethBought > 0, "Swap failed");
+        weth.forceApprove(address(amm), loanAmount);
+        amm.addLiquidity(tempCz, loanAmount, true);
 
+        // 2) Buy WETH cheap on skewed AMM with remaining CZ
+        uint256 czForSwap = amount - tempCz;
+        (, uint256 wethBought) = amm.swap(czForSwap, 0);
+        require(wethBought > 0, "AMM swap failed");
+
+        // 3) External leg: sell some WETH → USDC on Uniswap (realizes edge vs market)
+        // Sell half of bought WETH as example; bot can pass better params later
+        uint256 wethToSell = wethBought / 2;
+        if (wethToSell > 0) {
+            weth.forceApprove(address(UNI_ROUTER), wethToSell);
+            UNI_ROUTER.exactInputSingle(
+                IUniswapV3Router.ExactInputSingleParams({
+                    tokenIn: address(weth),
+                    tokenOut: address(usdc),
+                    fee: 500,
+                    recipient: address(this),
+                    deadline: deadline,
+                    amountIn: wethToSell,
+                    amountOutMinimum: minUsdcOut,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+            weth.forceApprove(address(UNI_ROUTER), 0);
+
+            // Optional: sell USDC back to WETH on another fee tier if that is the arb
+            // For v1 we keep USDC as profit buffer and prioritize WETH accounting
+        }
+
+        // 4) Remove temporary liquidity
         amm.removeMyTemporaryLiquidity();
 
+        // 5) Repay CZ flash mint
         cz.approve(address(cz), totalCzDebt);
 
-        uint256 remainingWeth = weth.balanceOf(address(this));
-        require(remainingWeth >= totalBalancerDebt + minProfit, "Not enough profit");
+        // 6) Profit check in WETH terms (must still repay Balancer after this returns)
+        uint256 bal = weth.balanceOf(address(this));
+        require(bal >= totalBalancerDebt + minProfit, "Not profitable");
 
-        uint256 profit = remainingWeth - totalBalancerDebt;
-        weth.safeTransfer(owner(), profit);
+        uint256 profit = bal - totalBalancerDebt;
+        // Leave totalBalancerDebt in contract for receiveFlashLoan to transfer to Vault
+        if (profit > 0) {
+            weth.safeTransfer(owner(), profit);
+        }
 
         emit CycleSuccess(amount, profit);
-
         return CALLBACK_SUCCESS;
     }
 
