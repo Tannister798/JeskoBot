@@ -12,8 +12,9 @@ import "./PrivateAMM.sol";
 
 /**
  * @title HouseBorrowerPure
- * @notice Test version - only CZ flash mint + PrivateAMM.
- *         No external flash loan (Aave / Balancer).
+ * @notice Test version — CZ flash mint + PrivateAMM only.
+ *         No Aave/Balancer. Requires fundWeth() first.
+ *         Does NOT include an external DEX leg (wiring test only).
  */
 contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     using SafeERC20 for IERC20;
@@ -23,6 +24,8 @@ contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     IERC20 public immutable weth;
 
     uint256 public minProfit = 0.00001 ether;
+    /// @notice WETH used as temporary AMM depth each cycle (must be pre-funded)
+    uint256 public tempWethAmount = 0.0005 ether;
     bool public paused;
 
     bytes32 private constant CALLBACK_SUCCESS =
@@ -30,6 +33,7 @@ contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
 
     event CycleStarted(uint256 mintAmount);
     event CycleSuccess(uint256 mintAmount, uint256 profit);
+    event Paused(bool isPaused);
 
     modifier whenNotPaused() {
         require(!paused, "Paused");
@@ -37,6 +41,7 @@ contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
     }
 
     constructor(address _cz, address _amm, address _weth) Ownable(msg.sender) {
+        require(_cz != address(0) && _amm != address(0) && _weth != address(0), "Zero");
         cz = CZToken(_cz);
         amm = PrivateAMM(_amm);
         weth = IERC20(_weth);
@@ -44,13 +49,21 @@ contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
 
     function setPaused(bool _paused) external onlyOwner {
         paused = _paused;
+        emit Paused(_paused);
     }
 
     function setMinProfit(uint256 _min) external onlyOwner {
         minProfit = _min;
     }
 
+    function setTempWethAmount(uint256 _amount) external onlyOwner {
+        require(_amount > 0, "Zero temp");
+        tempWethAmount = _amount;
+    }
+
+    /// @notice Pull WETH from owner into this contract for temp liquidity / buffer
     function fundWeth(uint256 amount) external onlyOwner {
+        require(amount > 0, "Zero");
         weth.safeTransferFrom(msg.sender, address(this), amount);
     }
 
@@ -84,26 +97,45 @@ contract HouseBorrowerPure is Ownable, ReentrancyGuard, IERC3156FlashBorrower {
 
         uint256 totalCzDebt = amount + fee;
 
-        uint256 tempWeth = 0.0005 ether;
-        require(weth.balanceOf(address(this)) >= tempWeth, "Need WETH in contract - call fundWeth first");
+        // Snapshot so we never drain the owner's funded buffer as "profit"
+        uint256 startWeth = weth.balanceOf(address(this));
+        uint256 tempWeth = tempWethAmount;
+        require(startWeth >= tempWeth, "Need WETH - call fundWeth first");
 
-        weth.approve(address(amm), tempWeth);
-        amm.addLiquidity(0, tempWeth);
+        // Two-sided temporary liquidity: small CZ side + temp WETH
+        uint256 tempCz = amount / 10;
+        if (tempCz == 0) tempCz = amount;
+        if (tempCz > amount) tempCz = amount;
 
-        cz.approve(address(amm), amount);
-        (, uint256 wethBought) = amm.swap(amount, 0);
+        cz.forceApprove(address(amm), amount);
+        weth.forceApprove(address(amm), tempWeth);
+        amm.addLiquidity(tempCz, tempWeth, true);
+
+        // Swap remaining CZ for WETH on skewed AMM
+        uint256 czForSwap = amount - tempCz;
+        if (czForSwap == 0) {
+            // If mint was tiny, swap full amount instead of failing
+            // (temp CZ still sits in pool until remove)
+            czForSwap = amount;
+        }
+
+        (, uint256 wethBought) = amm.swap(czForSwap, 0);
         require(wethBought > 0, "Swap failed");
 
+        // Pull back temporary liquidity
         amm.removeMyTemporaryLiquidity();
 
-        cz.approve(address(cz), totalCzDebt);
+        // Repay CZ flash mint
+        cz.forceApprove(address(cz), totalCzDebt);
 
+        // Only profit above the starting buffer counts
         uint256 remaining = weth.balanceOf(address(this));
-        require(remaining >= minProfit, "Not enough profit");
+        require(remaining >= startWeth + minProfit, "Not enough profit");
 
-        weth.safeTransfer(owner(), remaining);
+        uint256 profit = remaining - startWeth;
+        weth.safeTransfer(owner(), profit);
 
-        emit CycleSuccess(amount, remaining);
+        emit CycleSuccess(amount, profit);
         return CALLBACK_SUCCESS;
     }
 
