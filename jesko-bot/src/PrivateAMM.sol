@@ -5,23 +5,16 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-/**
- * token0 = CZ, token1 = WETH (or whatever you set at deploy)
- * Skew: buys of token1 (paying token0) get a better rate for the trader
- * so the house can buy cheap when it is the trader.
- */
 contract PrivateAMM is Ownable {
     using SafeERC20 for IERC20;
 
-    IERC20 public immutable token0;
-    IERC20 public immutable token1;
+    IERC20 public immutable token0; // CZ
+    IERC20 public immutable token1; // WETH (or other quote)
 
     uint256 public reserve0;
     uint256 public reserve1;
 
-    // Skew in bps applied in favor of token0→token1 swaps (house buy of WETH)
-    // 180 = 1.8%
-    uint256 public skewBps = 180;
+    uint256 public skewBps = 180; // 1.8%
     uint256 public constant MAX_SKEW_BPS = 500;
 
     mapping(address => uint256) public tempLiquidity0;
@@ -29,7 +22,13 @@ contract PrivateAMM is Ownable {
 
     event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, bool temporary);
     event LiquidityRemoved(address indexed provider, uint256 amount0, uint256 amount1);
-    event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out);
+    event Swap(
+        address indexed sender,
+        uint256 amount0In,
+        uint256 amount1In,
+        uint256 amount0Out,
+        uint256 amount1Out
+    );
     event SkewUpdated(uint256 skewBps);
 
     constructor(address _token0, address _token1) Ownable(msg.sender) {
@@ -45,8 +44,7 @@ contract PrivateAMM is Ownable {
         emit SkewUpdated(_skewBps);
     }
 
-    /// @notice amount0/amount1 deposited; if temporary=true both sides are tracked for later removal
-    function addLiquidity(uint256 amount0, uint256 amount1, bool temporary) external {
+    function addLiquidity(uint256 amount0, uint256 amount1, bool temporary) public {
         if (amount0 > 0) {
             token0.safeTransferFrom(msg.sender, address(this), amount0);
             reserve0 += amount0;
@@ -60,9 +58,9 @@ contract PrivateAMM is Ownable {
         emit LiquidityAdded(msg.sender, amount0, amount1, temporary);
     }
 
-    /// @notice Backward-compatible wrapper (treats deposits as temporary on token1 only was old behavior)
+    /// @dev Default: treat as temporary (bot path)
     function addLiquidity(uint256 amount0, uint256 amount1) external {
-        this.addLiquidity(amount0, amount1, true);
+        addLiquidity(amount0, amount1, true);
     }
 
     function removeMyTemporaryLiquidity() external {
@@ -91,22 +89,21 @@ contract PrivateAMM is Ownable {
         emit LiquidityRemoved(msg.sender, amount0, amount1);
     }
 
-    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, bool applySkewFavor)
-        public
-        view
-        returns (uint256)
-    {
+    function getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut,
+        bool applySkewFavor
+    ) public view returns (uint256) {
         require(amountIn > 0 && reserveIn > 0 && reserveOut > 0, "Invalid");
         uint256 baseOut = (reserveOut * amountIn) / (reserveIn + amountIn);
         if (applySkewFavor && skewBps > 0) {
-            // Trader receives more out (up to skewBps) — funded by pool reserves
             baseOut = baseOut + (baseOut * skewBps) / 10_000;
             if (baseOut >= reserveOut) baseOut = reserveOut - 1;
         }
         return baseOut;
     }
 
-    /// @notice Exactly one of amount0In / amount1In must be non-zero
     function swap(uint256 amount0In, uint256 amount1In)
         external
         returns (uint256 amount0Out, uint256 amount1Out)
@@ -114,7 +111,6 @@ contract PrivateAMM is Ownable {
         require((amount0In > 0) != (amount1In > 0), "One input only");
 
         if (amount0In > 0) {
-            // CZ in → WETH out (house buy of WETH) — skewed in trader's favor
             amount1Out = getAmountOut(amount0In, reserve0, reserve1, true);
             require(amount1Out > 0 && amount1Out < reserve1, "Insufficient liquidity");
             token0.safeTransferFrom(msg.sender, address(this), amount0In);
@@ -122,7 +118,6 @@ contract PrivateAMM is Ownable {
             reserve0 += amount0In;
             reserve1 -= amount1Out;
         } else {
-            // WETH in → CZ out — no favorable skew
             amount0Out = getAmountOut(amount1In, reserve1, reserve0, false);
             require(amount0Out > 0 && amount0Out < reserve0, "Insufficient liquidity");
             token1.safeTransferFrom(msg.sender, address(this), amount1In);
